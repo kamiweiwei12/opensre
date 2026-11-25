@@ -21,16 +21,24 @@ imported reference) would quietly call ``api.anthropic.com`` with a live key and
 still go **green** — passing for the wrong reason and making the assertions
 above it vacuous.
 
-This fixture removes that failure mode: any attempt to open a socket during a
-wizard test raises a loud ``AssertionError`` naming the fix. It is deliberately
-absolute — there is no allowlist, because no test in this package has any
-legitimate reason to talk to the network.
+This fixture removes that failure mode: any attempt to open an outbound socket
+during a wizard test raises a loud ``AssertionError`` naming the fix.
+
+The guard allows loopback (``127.0.0.1`` / ``::1`` / ``localhost``) connections
+only. That allowlist exists for a single reason: on Windows, ``asyncio``'s
+default ``ProactorEventLoop`` builds its self-pipe with ``socket.socketpair()``,
+which CPython emulates over a TCP loopback pair (``_fallback_socketpair`` in
+``socket.py``) because Windows has no native ``socketpair`` syscall. Blocking
+loopback therefore makes *any* event-loop creation fail on Windows — e.g. every
+``prompt_toolkit`` ``application.run()`` in the prompt tests — while passing on
+Unix, where ``socketpair`` is a native syscall that never calls ``connect()``.
+Loopback traffic cannot leave the host, so allowing it does not weaken the
+guard's purpose: connections to any non-loopback address still raise.
 """
 
 from __future__ import annotations
 
 import socket
-from typing import Never
 
 import pytest
 
@@ -41,6 +49,8 @@ _MESSAGE = (
     "— patching the name as imported into the module under test, not the module it "
     "was defined in. See tests/cli/wizard/conftest.py."
 )
+
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
 
 
 class LiveNetworkCallBlocked(BaseException):
@@ -63,13 +73,37 @@ class LiveNetworkCallBlocked(BaseException):
     """
 
 
+def _is_loopback(address: object) -> bool:
+    """Return True for TCP/UDP loopback targets; Unix sockets etc. are not loopback."""
+    return isinstance(address, tuple) and len(address) >= 1 and address[0] in _LOOPBACK_HOSTS
+
+
 @pytest.fixture(autouse=True)
 def _no_live_provider_calls(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Fail loudly if any wizard test opens a real socket."""
+    """Fail loudly if any wizard test opens a non-loopback socket."""
 
-    def _boom(*_args: object, **_kwargs: object) -> Never:
+    real_connect = socket.socket.connect
+    real_connect_ex = socket.socket.connect_ex
+    real_create_connection = socket.create_connection
+
+    def _guarded_connect(self: socket.socket, address: object) -> None:
+        if _is_loopback(address):
+            real_connect(self, address)  # type: ignore[arg-type]
+            return
         raise LiveNetworkCallBlocked(_MESSAGE)
 
-    monkeypatch.setattr(socket.socket, "connect", _boom)
-    monkeypatch.setattr(socket.socket, "connect_ex", _boom)
-    monkeypatch.setattr(socket, "create_connection", _boom)
+    def _guarded_connect_ex(self: socket.socket, address: object) -> int:
+        if _is_loopback(address):
+            return real_connect_ex(self, address)  # type: ignore[arg-type]
+        raise LiveNetworkCallBlocked(_MESSAGE)
+
+    def _guarded_create_connection(
+        address: object, *args: object, **kwargs: object
+    ) -> socket.socket:
+        if _is_loopback(address):
+            return real_create_connection(address, *args, **kwargs)  # type: ignore[arg-type]
+        raise LiveNetworkCallBlocked(_MESSAGE)
+
+    monkeypatch.setattr(socket.socket, "connect", _guarded_connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", _guarded_connect_ex)
+    monkeypatch.setattr(socket, "create_connection", _guarded_create_connection)
